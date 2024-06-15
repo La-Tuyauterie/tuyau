@@ -2,12 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strconv"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
+
+	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 type EventDocumentKey struct {
@@ -31,6 +38,69 @@ type Event struct {
 	FullDocument  interface{}      `bson:"fullDocument"`
 	Namespace     EventNamespace   `bson:"ns"`
 	DocumentKey   EventDocumentKey `bson:"documentKey"`
+}
+
+func rollback(ctx context.Context, client *kgo.Client) {
+	if err := client.AbortBufferedRecords(ctx); err != nil {
+		fmt.Printf("error aborting buffered records: %v\n", err) // this only happens if ctx is canceled
+		return
+	}
+	if err := client.EndTransaction(ctx, kgo.TryAbort); err != nil {
+		fmt.Printf("error rolling back transaction: %v\n", err)
+		return
+	}
+	fmt.Println("transaction rolled back")
+}
+
+func dispatchEvent(ctx context.Context, event Event) {
+	producerId := strconv.FormatInt(int64(os.Getpid()), 10)
+	client, err := kgo.NewClient(
+		kgo.SeedBrokers("localhost:9092"),
+		kgo.TransactionalID(producerId),
+		kgo.DefaultProduceTopic("tuyau-broadcast"),
+	)
+
+	if err != nil {
+		fmt.Printf("error initializing Kafka producer client: %v\n", err)
+		return
+	}
+
+	defer client.Close()
+
+	if err := client.BeginTransaction(); err != nil {
+		fmt.Printf("error beginning transaction: %v\n", err)
+	}
+
+	fmt.Println("Transaction began")
+
+	// Write some messages in the transaction.
+	data, err := json.Marshal(event)
+	if err != nil {
+		fmt.Printf("error beginning transaction: %v\n", err)
+		rollback(ctx, client)
+	}
+
+	fmt.Printf("JSON done: %s\n", string(data))
+
+	if err := client.ProduceSync(ctx, kgo.StringRecord(string(data))).FirstErr(); err != nil {
+		fmt.Printf("NOT PRODUCED %+v", err)
+		rollback(ctx, client)
+	}
+
+	if err := client.Flush(ctx); err != nil {
+		fmt.Printf("flush was killed due to context cancelation\n")
+	}
+
+	switch err := client.EndTransaction(ctx, kgo.TryCommit); err {
+	case nil:
+	case kerr.OperationNotAttempted:
+		println("NOT ATTEMPTED")
+		rollback(ctx, client)
+	default:
+		fmt.Printf("error committing transaction: %v\n", err)
+	}
+
+	fmt.Println("producer exited")
 }
 
 func main() {
@@ -69,6 +139,7 @@ func main() {
 			panic(err)
 		}
 
-		// send elsewhere
+		println("Dispatching event")
+		dispatchEvent(ctx, currentEvent)
 	}
 }
